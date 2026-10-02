@@ -4,7 +4,8 @@ import { getNamingConventionRule, tsFileExtensions } from '@blitz/eslint-plugin/
 
 export default [
   {
-    ignores: ['**/dist', '**/node_modules', '**/.wrangler', '**/bolt/build'],
+    /* build/ is ignored too, remix vite:build writes the whole bundle there */
+    ignores: ['**/dist', '**/node_modules', '**/.wrangler', '**/build'],
   },
   ...blitzPlugin.configs.recommended(),
   {
