@@ -14,6 +14,9 @@ importers:
       '@ai-sdk/anthropic':
         specifier: ^0.0.39
         version: 0.0.39(zod@3.23.8)
+      '@ai-sdk/openai':
+        specifier: ^0.0.44
+        version: 0.0.44(zod@3.23.8)
       '@codemirror/autocomplete':
         specifier: ^6.17.0
         version: 6.17.0(@codemirror/language@6.10.2)(@codemirror/state@6.4.1)(@codemirror/view@6.28.4)(@lezer/common@1.2.1)
@@ -233,6 +236,12 @@ packages:
 
   '@ai-sdk/anthropic@0.0.39':
     resolution: {integrity: sha512-Ouku41O9ebyRi0EUW7pB8+lk4sI74SfJKydzK7FjynhNmCSvi42+U4WPlEjP64NluXUzpkYLvBa6BAd36VY4/g==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.0.0
+
+  '@ai-sdk/openai@0.0.44':
+    resolution: {integrity: sha512-fIUypicSnuWIOdoRG+dgzAnZDWQrhzqyUvQaLC8hQB6UDAUXkn8sIPdsqKEV35vs3mNXDz/KZ4EEeLxSVGrzMg==}
     engines: {node: '>=18'}
     peerDependencies:
       zod: ^3.0.0
@@ -5197,6 +5206,12 @@ packages:
 snapshots:
 
   '@ai-sdk/anthropic@0.0.39(zod@3.23.8)':
+    dependencies:
+      '@ai-sdk/provider': 0.0.17
+      '@ai-sdk/provider-utils': 1.0.9(zod@3.23.8)
+      zod: 3.23.8
+
+  '@ai-sdk/openai@0.0.44(zod@3.23.8)':
     dependencies:
       '@ai-sdk/provider': 0.0.17
       '@ai-sdk/provider-utils': 1.0.9(zod@3.23.8)

@@ -1,5 +1,6 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { StreamingTextResponse, parseStreamPart } from 'ai';
+import { getEnhancerModel } from '~/lib/.server/llm/model';
 import { streamText } from '~/lib/.server/llm/stream-text';
 import { stripIndents } from '~/utils/stripIndent';
 
@@ -30,6 +31,8 @@ async function enhancerAction({ context, request }: ActionFunctionArgs) {
         },
       ],
       context.cloudflare.env,
+      undefined,
+      getEnhancerModel(context.cloudflare.env),
     );
 
     const transformStream = new TransformStream({
