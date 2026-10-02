@@ -1,8 +1,11 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { createScopedLogger } from '~/utils/logger';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS } from '~/lib/.server/llm/constants';
 import { CONTINUE_PROMPT } from '~/lib/.server/llm/prompts';
 import { streamText, type Messages, type StreamingOptions } from '~/lib/.server/llm/stream-text';
 import SwitchableStream from '~/lib/.server/llm/switchable-stream';
+
+const logger = createScopedLogger('chat');
 
 export async function action(args: ActionFunctionArgs) {
   return chatAction(args);
@@ -49,11 +52,27 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
       },
     });
   } catch (error) {
-    console.log(error);
+    logger.error('chat request failed', error);
 
-    throw new Response(null, {
+    throw new Response(JSON.stringify({ error: toClientErrorMessage(error) }), {
       status: 500,
       statusText: 'Internal Server Error',
+      headers: { 'content-type': 'application/json' },
     });
   }
+}
+
+/**
+ * Turns provider failures into a short hint the UI can show, without leaking
+ * keys: the user is told which knob to check.
+ */
+function toClientErrorMessage(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+
+  return [
+    'All configured models failed.',
+    `Last error: ${detail}.`,
+    'Check LLM_BASE_URL, LLM_API_KEY, LLM_MODEL and LLM_FALLBACK_MODELS in .env.local.',
+    'Run "pnpm run check-llm" or open GET /api/llm-check to see which models answer.',
+  ].join(' ');
 }

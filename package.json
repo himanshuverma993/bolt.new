@@ -10,6 +10,8 @@
     "deploy": "npm run build && wrangler pages deploy",
     "build": "remix vite:build",
     "dev": "remix vite:dev",
+    "check-llm": "node scripts/check-provider.mjs",
+    "mock-llm": "node scripts/mock-openai-server.mjs",
     "test": "vitest --run",
     "test:watch": "vitest",
     "lint": "eslint --cache --cache-location ./node_modules/.cache/eslint .",

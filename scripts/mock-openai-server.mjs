@@ -56,14 +56,29 @@ async function readBody(req) {
 /**
  * Starts an OpenAI-compatible HTTP server.
  *
- * @param {{ port?: number, failModels?: string[], response?: string, log?: (message: string) => void }} options
- * @returns {Promise<{ url: string, port: number, requests: string[], close: () => Promise<void> }>} the server handle
+ * Failures can be simulated per model, which is what the unit tests use:
+ * `failModels` answers with `failStatus`, `stallModels` never answers, and
+ * `stallAfterFirstChunkModels` sends one content chunk and then goes silent.
+ *
+ * @param {object} [options] configuration, every field is optional
+ * @param {number} [options.port] 0 picks a free port, which the tests rely on
+ * @param {string[]} [options.failModels] model ids answered with `failStatus`
+ * @param {number} [options.failStatus] HTTP status for those models, default 429
+ * @param {string[]} [options.stallModels] model ids whose request never answers
+ * @param {string[]} [options.stallAfterFirstChunkModels] model ids that go silent mid-stream
+ * @param {string} [options.response] text streamed by the working model
+ * @param {(message: string) => void} [options.log] logger, silent by default
+ * @returns {Promise<object>} handle with `url`, `port`, `requests`, `calls` and `close`
  */
 export function startMockProvider(options = {}) {
   const failModels = options.failModels ?? ['mock-fail'];
+  const failStatus = options.failStatus ?? 429;
+  const stallModels = options.stallModels ?? [];
+  const stallAfterFirstChunkModels = options.stallAfterFirstChunkModels ?? [];
   const response = options.response ?? DEFAULT_MOCK_RESPONSE;
   const log = options.log ?? (() => undefined);
   const requests = [];
+  const calls = [];
 
   const server = createServer(async (req, res) => {
     if (req.url?.startsWith('/v1/') !== true) {
@@ -84,11 +99,28 @@ export function startMockProvider(options = {}) {
 
     const model = body.model ?? 'mock';
     requests.push(model);
+    calls.push({ model, headers: req.headers, body });
     log(`[mock] ${req.method} ${req.url} model=${model} stream=${body.stream === true}`);
 
+    if (stallModels.includes(model)) {
+      log(`[mock] -> holding the connection open for model=${model}`);
+
+      return;
+    }
+
     if (failModels.includes(model)) {
-      log(`[mock] -> 429 for model=${model}`);
-      sendJson(res, 429, { error: { message: `Mock quota exceeded for ${model}`, type: 'rate_limit_error' } });
+      log(`[mock] -> ${failStatus} for model=${model}`);
+      sendJson(res, failStatus, {
+        error: { message: `Mock failure for ${model}`, type: 'rate_limit_error' },
+      });
+
+      return;
+    }
+
+    if (stallAfterFirstChunkModels.includes(model)) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(chunk({ content: 'partial ' }));
+      log(`[mock] -> sent one chunk and went silent for model=${model}`);
 
       return;
     }
@@ -132,7 +164,12 @@ export function startMockProvider(options = {}) {
         url: `http://127.0.0.1:${port}/v1`,
         port,
         requests,
-        close: () => new Promise((done) => server.close(() => done())),
+        calls,
+        close: () =>
+          new Promise((done) => {
+            server.closeAllConnections?.();
+            server.close(() => done());
+          }),
       });
     });
   });

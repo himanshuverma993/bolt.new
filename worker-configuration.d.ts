@@ -9,7 +9,11 @@ interface Env {
   LLM_FALLBACK_MODELS?: string;
   LLM_MAX_TOKENS?: string;
   LLM_MAX_RETRIES?: string;
+  LLM_TEMPERATURE?: string;
   LLM_HEADERS?: string;
+  LLM_EXTRA_BODY?: string;
+  LLM_FIRST_TOKEN_TIMEOUT_MS?: string;
+  LLM_IDLE_TIMEOUT_MS?: string;
   LLM_ENHANCER_MODEL?: string;
 
   /* aliases kept for the OpenAI-compatible configuration */

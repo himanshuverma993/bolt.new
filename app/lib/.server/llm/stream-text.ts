@@ -1,7 +1,12 @@
 import { streamText as _streamText, convertToCoreMessages } from 'ai';
 import { createScopedLogger } from '~/utils/logger';
-import { MAX_TOKENS } from './constants';
-import { getMaxRetries, getModelCandidates, type ModelCandidate } from './model';
+import {
+  getMaxRetries,
+  getModelCandidates,
+  getStreamTimeouts,
+  type ModelCandidate,
+  type StreamTimeouts,
+} from './model';
 import { getSystemPrompt } from './prompts';
 
 interface ToolResult<Name extends string, Args, Result> {
@@ -21,58 +26,184 @@ export type Messages = Message[];
 
 export type StreamingOptions = Omit<Parameters<typeof _streamText>[0], 'model'>;
 
-const logger = createScopedLogger('llm');
-
 export interface LLMStream {
   toAIStream(): ReadableStream<Uint8Array>;
 }
 
-export function streamText(
+const logger = createScopedLogger('llm');
+
+/**
+ * Resolves the model chain and opens the first model that actually produces
+ * tokens. A rejected attempt (401/403/429/5xx/network/timeout) is retried with
+ * the next candidate, and an exhausted chain throws, so the route can answer
+ * with a real HTTP error instead of a broken stream.
+ */
+export async function streamText(
   messages: Messages,
   env: Env,
   options?: StreamingOptions,
   modelOverride?: string,
-): LLMStream {
+): Promise<LLMStream> {
   const candidates = getModelCandidates(env, modelOverride);
+  const timeouts = getStreamTimeouts(env);
+  const maxRetries = getMaxRetries(env);
+
+  const attempt = await openWithFallback(candidates, messages, options, maxRetries, timeouts);
+
+  let stream: ReadableStream<Uint8Array> | undefined;
 
   return {
-    toAIStream: () => streamWithFallback(candidates, messages, options, getMaxRetries(env)),
+    toAIStream: () => (stream ??= pumpRemainingChunks(attempt, timeouts)),
   };
 }
 
-function createAttempt(candidate: ModelCandidate, messages: Messages, options?: StreamingOptions, maxRetries = 0) {
+interface OpenAttempt {
+  candidate: ModelCandidate;
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  firstChunk: Uint8Array;
+  abort: AbortController;
+}
+
+function createAttempt(
+  candidate: ModelCandidate,
+  messages: Messages,
+  options: StreamingOptions | undefined,
+  maxRetries: number,
+  abortSignal: AbortSignal,
+) {
   return _streamText({
+    ...options,
     model: candidate.model,
     system: getSystemPrompt(),
-    maxTokens: candidate.maxTokens || MAX_TOKENS,
+    maxTokens: candidate.maxTokens,
+    temperature: candidate.temperature,
     headers: candidate.headers,
     maxRetries,
+    abortSignal,
     messages: convertToCoreMessages(messages),
-    ...options,
   });
 }
 
 /**
- * Streams from the first model that produces output, falling back to the next
- * candidate when a provider rejects the request (401/403/429/quota/timeouts).
- *
- * Failover only happens *before* the first token reaches the client. Once a
- * partial response has been sent we cannot restart it, otherwise the browser
- * would receive two interleaved artifacts.
+ * Races a promise against a deadline and aborts the upstream request when the
+ * deadline is hit, so a hanging free provider cannot block the whole chain.
  */
-function streamWithFallback(
+function withTimeout<T>(promise: Promise<T>, ms: number, abort: AbortController, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      abort.abort();
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function linkAbortSignal(source: AbortSignal | undefined, target: AbortController) {
+  if (source === undefined) {
+    return;
+  }
+
+  if (source.aborted) {
+    target.abort();
+
+    return;
+  }
+
+  source.addEventListener('abort', () => target.abort(), { once: true });
+}
+
+function describeError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function openWithFallback(
   candidates: ModelCandidate[],
   messages: Messages,
-  options?: StreamingOptions,
-  maxRetries = 0,
-): ReadableStream<Uint8Array> {
+  options: StreamingOptions | undefined,
+  maxRetries: number,
+  timeouts: StreamTimeouts,
+): Promise<OpenAttempt> {
+  let lastError: unknown = undefined;
+
+  for (const [index, candidate] of candidates.entries()) {
+    const isLast = index === candidates.length - 1;
+    const label = `${candidate.provider}/${candidate.modelId}`;
+    const abort = new AbortController();
+    const deadline = Date.now() + timeouts.firstTokenMs;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
+    linkAbortSignal(options?.abortSignal, abort);
+
+    try {
+      const result = await withTimeout(
+        createAttempt(candidate, messages, options, maxRetries, abort.signal),
+        timeouts.firstTokenMs,
+        abort,
+        `${label} request`,
+      );
+
+      /* an abandoned attempt rejects, so keep that promise handled */
+      result.text.catch(() => undefined);
+
+      reader = result.toAIStream().getReader();
+
+      const chunk = await withTimeout(
+        reader.read(),
+        Math.max(1000, deadline - Date.now()),
+        abort,
+        `${label} first token`,
+      );
+
+      if (chunk.done || chunk.value === undefined) {
+        throw new Error('the model returned an empty response');
+      }
+
+      logger.info(`using ${label}`);
+
+      return { candidate, reader, firstChunk: chunk.value, abort };
+    } catch (error) {
+      lastError = error;
+
+      logger.warn(`${label} failed${isLast ? '' : ', trying the next model'}:`, describeError(error));
+
+      abort.abort();
+
+      try {
+        await reader?.cancel();
+      } catch {
+        /* the attempt already failed, nothing to clean up */
+      }
+
+      if (isLast) {
+        break;
+      }
+    }
+  }
+
+  throw lastError ?? new Error('No model candidates available');
+}
+
+/**
+ * Forwards the buffered first chunk and then keeps pumping the model stream.
+ *
+ * The idle watchdog aborts a stream that stops producing tokens. Failover is
+ * not possible here: the client already received part of the response.
+ */
+function pumpRemainingChunks(attempt: OpenAttempt, timeouts: StreamTimeouts): ReadableStream<Uint8Array> {
   let cancelled = false;
-  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let lastError: unknown = undefined;
-
+    start(controller) {
       const safeEnqueue = (chunk: Uint8Array) => {
         if (cancelled) {
           return;
@@ -86,41 +217,41 @@ function streamWithFallback(
         }
       };
 
-      for (const [index, candidate] of candidates.entries()) {
+      const safeClose = () => {
+        try {
+          controller.close();
+        } catch {
+          /* the consumer cancelled the response before we finished */
+        }
+      };
+
+      const fail = (error: unknown) => {
         if (cancelled) {
           return;
         }
 
-        const isLast = index === candidates.length - 1;
-        let attemptReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-        let started = false;
-
         try {
-          const result = await createAttempt(candidate, messages, options, maxRetries);
+          controller.error(error);
+        } catch {
+          /* the consumer is already gone */
+        }
+      };
 
-          /* when an attempt is abandoned this promise rejects, so keep it handled */
-          result.text.catch(() => undefined);
+      safeEnqueue(attempt.firstChunk);
 
-          attemptReader = result.toAIStream().getReader();
-          activeReader = attemptReader;
-
-          const firstChunk = await attemptReader.read();
-
-          if (cancelled) {
-            return;
-          }
-
-          if (firstChunk.done || firstChunk.value === undefined) {
-            throw new Error('The model returned an empty response');
-          }
-
-          /* failover is only safe before the first byte reaches the client */
-          started = true;
-          logger.info(`using ${candidate.provider}/${candidate.modelId}`);
-          safeEnqueue(firstChunk.value);
-
+      void (async () => {
+        try {
           for (;;) {
-            const { done, value } = await attemptReader.read();
+            if (cancelled) {
+              return;
+            }
+
+            const { done, value } = await withTimeout(
+              attempt.reader.read(),
+              timeouts.idleMs,
+              attempt.abort,
+              `${attempt.candidate.provider}/${attempt.candidate.modelId} stream`,
+            );
 
             if (cancelled) {
               return;
@@ -133,60 +264,24 @@ function streamWithFallback(
             safeEnqueue(value);
           }
 
-          activeReader = undefined;
-
-          try {
-            controller.close();
-          } catch {
-            /* the consumer cancelled the response before we finished */
-          }
-
-          return;
+          safeClose();
         } catch (error) {
-          activeReader = undefined;
-          lastError = error;
-
-          if (cancelled) {
-            return;
-          }
-
-          if (started) {
-            logger.error(
-              `${candidate.provider}/${candidate.modelId} failed mid-stream, cannot fail over to another model`,
-              error,
-            );
-            controller.error(error);
-
-            return;
-          }
-
-          logger.warn(
-            `${candidate.provider}/${candidate.modelId} failed${isLast ? '' : ', trying the next model'}:`,
-            error instanceof Error ? error.message : error,
+          logger.error(
+            `${attempt.candidate.provider}/${attempt.candidate.modelId} failed mid-stream, cannot fail over:`,
+            describeError(error),
           );
 
-          try {
-            await attemptReader?.cancel();
-          } catch {
-            /* the attempt already failed, nothing to clean up */
-          }
-
-          if (isLast) {
-            break;
-          }
+          fail(error);
         }
-      }
-
-      if (!cancelled) {
-        controller.error(lastError ?? new Error('No model candidates available'));
-      }
+      })();
     },
 
     async cancel() {
       cancelled = true;
+      attempt.abort.abort();
 
       try {
-        await activeReader?.cancel();
+        await attempt.reader.cancel();
       } catch {
         /* upstream is already gone */
       }
