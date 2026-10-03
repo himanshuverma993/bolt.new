@@ -69,10 +69,16 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 function toClientErrorMessage(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error);
 
+  /* Workers AI answers with 429 / "quota" / neuron errors once the daily free allowance is used */
+  const quotaHint = /\b(429|quota|neurons?|rate.?limit|3036|3040)\b/i.test(detail)
+    ? ' If you are on Workers AI, the free allowance (10,000 neurons per day) may be used up; it resets at 00:00 UTC.'
+    : '';
+
   return [
     'All configured models failed.',
-    `Last error: ${detail}.`,
-    'Check LLM_BASE_URL, LLM_API_KEY, LLM_MODEL and LLM_FALLBACK_MODELS in .env.local.',
+    `Last error: ${detail}.${quotaHint}`,
+    'On Cloudflare check the AI binding and LLM_MODEL / LLM_FALLBACK_MODELS in wrangler.toml (see CLOUDFLARE-DEPLOY.md);',
+    'locally check LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in .env.local.',
     'Run "pnpm run check-llm" or open GET /api/llm-check to see which models answer.',
   ].join(' ');
 }

@@ -2,6 +2,7 @@ export default class SwitchableStream extends TransformStream {
   private _controller: TransformStreamDefaultController | null = null;
   private _currentReader: ReadableStreamDefaultReader | null = null;
   private _switches = 0;
+  private _closed = false;
 
   constructor() {
     let controllerRef: TransformStreamDefaultController | undefined;
@@ -40,19 +41,30 @@ export default class SwitchableStream extends TransformStream {
       while (true) {
         const { done, value } = await this._currentReader.read();
 
-        if (done) {
+        /**
+         * `close()` runs from the provider's onFinish callback, which can fire
+         * while the trailing stream parts are still in flight: once the stream
+         * is terminated those parts are dropped instead of raising an error.
+         */
+        if (done || this._closed) {
           break;
         }
 
         this._controller.enqueue(value);
       }
     } catch (error) {
+      if (this._closed) {
+        return;
+      }
+
       console.log(error);
       this._controller.error(error);
     }
   }
 
   close() {
+    this._closed = true;
+
     if (this._currentReader) {
       this._currentReader.cancel();
     }

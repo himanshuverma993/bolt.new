@@ -1,5 +1,31 @@
 #:schema node_modules/wrangler/config-schema.json
+#
+# Cloudflare Pages configuration (source of truth once deployed, see
+# CLOUDFLARE-DEPLOY.md). Non-secret settings live here; secrets go through
+# `wrangler pages secret put NAME` or the dashboard ("Encrypt").
+#
 name = "bolt"
 compatibility_flags = ["nodejs_compat"]
 compatibility_date = "2024-07-01"
 pages_build_output_dir = "./build/client"
+
+# Workers AI: exposed to the app as context.cloudflare.env.AI.
+# No API key needed, usage is billed to this account (Free plan: 10,000 neurons/day).
+[ai]
+binding = "AI"
+
+[vars]
+# Use Workers AI through the binding above (REST fallback when CLOUDFLARE_ACCOUNT_ID
+# + CLOUDFLARE_API_TOKEN secrets are also set). Alternatives: "openai", "anthropic".
+LLM_PROVIDER = "cloudflare"
+
+# Model chain, tried in order until one streams. All of these run on the Free plan;
+# model ids and prices: https://developers.cloudflare.com/workers-ai/models/
+LLM_MODEL = "@cf/google/gemma-4-26b-a4b-it"
+LLM_FALLBACK_MODELS = "@cf/qwen/qwen2.5-coder-32b-instruct,@cf/meta/llama-4-scout-17b-16e-instruct"
+
+# Cheap model for the "enhance prompt" button, so it does not eat the main quota.
+LLM_ENHANCER_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8"
+
+# Free tiers throttle with 429: move on to the next model instead of retrying.
+LLM_MAX_RETRIES = "0"
