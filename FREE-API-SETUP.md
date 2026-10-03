@@ -3,6 +3,9 @@
 > Ye guide tumhari "free API catalog" file ke saath use karne ke liye hai. Wiring **model-ID agnostic** hai:
 > jo bhi OpenAI-compatible endpoint + model id tumhare paas hai, wahi yahan plug ho jata hai.
 > Yahan sab kuch **is repo ke actual code** ke hisaab se likha hai (`app/lib/.server/llm/*`, `app/routes/api.*`).
+>
+> **Cloudflare par deploy + free Workers AI** (binding, koi key nahi) ke liye alag guide hai: [CLOUDFLARE-DEPLOY.md](./CLOUDFLARE-DEPLOY.md).
+> Ye repo ab default usi par set hai (`wrangler.toml` me `LLM_PROVIDER=cloudflare`); neeche wale providers `.env.local` se override karte hain.
 
 ---
 
@@ -147,7 +150,7 @@ Ek waqt me ek `LLM_BASE_URL` chalta hai (chain usi endpoint ke andar rehti hai).
 
 | Env var | Default | Kaam |
 | --- | --- | --- |
-| `LLM_PROVIDER` | auto-detect | `openai` (OpenAI-compatible) ya `anthropic` |
+| `LLM_PROVIDER` | auto-detect | `cloudflare` (Workers AI, dekho [CLOUDFLARE-DEPLOY.md](./CLOUDFLARE-DEPLOY.md)), `openai` (OpenAI-compatible) ya `anthropic` |
 | `LLM_BASE_URL` | — | OpenAI-compatible endpoint (`OPENAI_BASE_URL`, `OPENAI_API_BASE` alias) |
 | `LLM_API_KEY` | — | (`OPENAI_API_KEY` alias) |
 | `LLM_MODEL` | — | Primary model id (`OPENAI_MODEL` alias), `model|maxTokens` syntax supported |
@@ -160,8 +163,9 @@ Ek waqt me ek `LLM_BASE_URL` chalta hai (chain usi endpoint ke andar rehti hai).
 | `LLM_FIRST_TOKEN_TIMEOUT_MS` | `120000` | First token + cold start ka budget; isse zyada lage to next model |
 | `LLM_IDLE_TIMEOUT_MS` | `60000` | Stream beech me chup ho jaye to itne me abort |
 | `LLM_ENHANCER_MODEL` | — | Prompt-enhancer ke liye alag (sasta/fast) model |
-| `ANTHROPIC_API_KEY` | — | Default setup |
+| `ANTHROPIC_API_KEY` | — | Anthropic setup |
 | `ANTHROPIC_BASE_URL` | — | Anthropic proxy use karna ho to (beta header tab auto-drop hota hai) |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_AI_*`, `LLM_STREAM_COALESCE_MS` | — | Workers AI ke liye — [CLOUDFLARE-DEPLOY.md §7](./CLOUDFLARE-DEPLOY.md#7-env-reference-cloudflare-specific) |
 
 Request body me `tools` kabhi nahi jaata. Per-model cap example:
 
@@ -179,6 +183,10 @@ LLM_FALLBACK_MODELS=small-model:free|4096,another-model:free
 4. **Sab** fail → `/api/chat` **HTTP 500** deta hai + JSON body me hint (pehle broken 200 stream milti thi).
 5. Mid-stream fail → failover nahi (error), kyunki partial output already chala gaya.
 6. Client cancel (Stop button / tab band) → upstream request abort ho jaati hai.
+7. Provider precedence: `LLM_PROVIDER` set ho to wahi; warna `LLM_BASE_URL`/`LLM_API_KEY` → `openai`, `ANTHROPIC_API_KEY` →
+   `anthropic`, aur kuch na ho par Workers AI reachable ho (`AI` binding ya `CLOUDFLARE_ACCOUNT_ID`+`CLOUDFLARE_API_TOKEN`) →
+   `cloudflare`. `pnpm run dev` / deploy me `wrangler.toml` ka `LLM_PROVIDER=cloudflare` already set hai — `.env.local` me
+   `LLM_PROVIDER=openai` likh kar override karo (process.env pehle padha jata hai).
 
 ---
 

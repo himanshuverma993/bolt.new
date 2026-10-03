@@ -4,11 +4,30 @@ import type { LanguageModel } from 'ai';
 import { env as processEnv } from 'node:process';
 import { createScopedLogger } from '~/utils/logger';
 import { getAPIKey } from './api-key';
+import {
+  createWorkersAI,
+  DEFAULT_COALESCE_MS,
+  isWorkersAIBinding,
+  type WorkersAIBinding,
+  type WorkersAITransport,
+} from './workers-ai';
 
 const logger = createScopedLogger('llm');
 
 const DEFAULT_ANTHROPIC_MODEL = 'claude-3-5-sonnet-20240620';
 const DEFAULT_MAX_TOKENS = 8192;
+
+/**
+ * Workers AI defaults: every model below is available on the Workers Free plan
+ * (10k neurons/day) and answers with plain content, no inline reasoning.
+ * Gemma 4 is the cheapest strong option (~130 neurons per Bolt request), the
+ * fallbacks are a proven coder model and a long-context generalist.
+ */
+export const DEFAULT_WORKERS_AI_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+export const DEFAULT_WORKERS_AI_FALLBACK_MODELS = [
+  '@cf/qwen/qwen2.5-coder-32b-instruct',
+  '@cf/meta/llama-4-scout-17b-16e-instruct',
+];
 
 /* free TGI backends behind the Hugging Face router tend to reject temperature 0 */
 const DEFAULT_OPENAI_TEMPERATURE = 0.2;
@@ -17,10 +36,15 @@ const DEFAULT_OPENAI_TEMPERATURE = 0.2;
 const DEFAULT_FIRST_TOKEN_TIMEOUT_MS = 120_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 
-export type LLMProvider = 'anthropic' | 'openai';
+export type LLMProvider = 'anthropic' | 'openai' | 'cloudflare';
+
+export type CloudflareTransport = 'binding' | 'rest';
 
 export interface ModelCandidate {
   provider: LLMProvider;
+
+  /** only set for Workers AI: how the model is reached */
+  transport?: CloudflareTransport;
   modelId: string;
   model: LanguageModel;
   maxTokens: number;
@@ -186,13 +210,165 @@ export function getEnhancerModel(cloudflareEnv: Env): string | undefined {
 }
 
 /**
+ * Human readable name of a candidate for logs and diagnostics, for example
+ * `cloudflare:binding/@cf/google/gemma-4-26b-a4b-it` or `openai/gpt-4o`.
+ */
+export function candidateLabel(candidate: Pick<ModelCandidate, 'provider' | 'transport' | 'modelId'>) {
+  const transport = candidate.transport === undefined ? '' : `:${candidate.transport}`;
+
+  return `${candidate.provider}${transport}/${candidate.modelId}`;
+}
+
+function dedupe<T extends { modelId: string; transport?: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+
+  return items.filter((item) => {
+    const key = `${item.transport ?? ''}|${item.modelId}`;
+
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+
+    return true;
+  });
+}
+
+export interface CloudflareAIConfig {
+  binding?: WorkersAIBinding;
+  accountId?: string;
+  apiToken?: string;
+  gatewayId?: string;
+  baseURL?: string;
+  transport: 'auto' | CloudflareTransport;
+}
+
+/**
+ * Reads everything needed to reach Workers AI.
+ *
+ * The `AI` binding comes from wrangler.toml (`[ai] binding = "AI"`) and is the
+ * zero-config path on Cloudflare. `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`
+ * enable the REST API, which also works on a laptop without `wrangler login`.
+ */
+export function getCloudflareAIConfig(cloudflareEnv: Env | undefined): CloudflareAIConfig {
+  const binding = (cloudflareEnv as { AI?: unknown } | undefined)?.AI;
+  const transportSetting = readEnv(cloudflareEnv, 'CLOUDFLARE_AI_TRANSPORT')?.toLowerCase();
+
+  return {
+    binding: isWorkersAIBinding(binding) ? binding : undefined,
+    accountId: readEnv(cloudflareEnv, 'CLOUDFLARE_ACCOUNT_ID', 'CF_ACCOUNT_ID'),
+    apiToken: readEnv(cloudflareEnv, 'CLOUDFLARE_API_TOKEN', 'CF_API_TOKEN'),
+    gatewayId: readEnv(cloudflareEnv, 'CLOUDFLARE_AI_GATEWAY_ID'),
+    baseURL: readEnv(cloudflareEnv, 'CLOUDFLARE_AI_BASE_URL'),
+    transport: transportSetting === 'binding' || transportSetting === 'rest' ? transportSetting : 'auto',
+  };
+}
+
+const PROVIDER_ALIASES: Record<string, LLMProvider> = {
+  anthropic: 'anthropic',
+  openai: 'openai',
+  cloudflare: 'cloudflare',
+  'cloudflare-ai': 'cloudflare',
+  'workers-ai': 'cloudflare',
+  workersai: 'cloudflare',
+};
+
+function normalizeProvider(value: string | undefined): LLMProvider | undefined {
+  return value === undefined ? undefined : PROVIDER_ALIASES[value.toLowerCase()];
+}
+
+function cloudflareTransports(config: CloudflareAIConfig): WorkersAITransport[] {
+  const transports: WorkersAITransport[] = [];
+
+  if (config.transport !== 'rest' && config.binding !== undefined) {
+    transports.push({ kind: 'binding', ai: config.binding, gatewayId: config.gatewayId });
+  }
+
+  if (config.transport !== 'binding' && config.accountId !== undefined && config.apiToken !== undefined) {
+    transports.push({
+      kind: 'rest',
+      accountId: config.accountId,
+      apiToken: config.apiToken,
+      gatewayId: config.gatewayId,
+      baseURL: config.baseURL,
+    });
+  }
+
+  return transports;
+}
+
+function buildCloudflareCandidates(
+  cloudflareEnv: Env,
+  config: CloudflareAIConfig,
+  primaryModel: string | undefined,
+  fallbackModels: string | undefined,
+  defaultMaxTokens: number,
+): ModelCandidate[] {
+  const transports = cloudflareTransports(config);
+
+  if (transports.length === 0) {
+    const why =
+      config.transport === 'rest'
+        ? 'CLOUDFLARE_AI_TRANSPORT=rest needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN.'
+        : config.transport === 'binding'
+          ? 'CLOUDFLARE_AI_TRANSPORT=binding needs the AI binding: add `[ai] binding = "AI"` to wrangler.toml.'
+          : 'Workers AI is not reachable: deploy with the `[ai] binding = "AI"` from wrangler.toml, or set CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (see CLOUDFLARE-DEPLOY.md).';
+
+    throw new Error(why);
+  }
+
+  /* zero-config: a complete free-plan chain when no model is configured at all */
+  const specs =
+    primaryModel === undefined
+      ? [
+          { modelId: DEFAULT_WORKERS_AI_MODEL },
+          ...DEFAULT_WORKERS_AI_FALLBACK_MODELS.map((modelId) => ({ modelId })),
+          ...parseModelSpecs(fallbackModels),
+        ]
+      : [...parseModelSpecs(primaryModel), ...parseModelSpecs(fallbackModels)];
+
+  const extraBody = readJsonObject(cloudflareEnv, 'LLM_EXTRA_BODY');
+  const headers = readJsonObject(cloudflareEnv, 'LLM_HEADERS') as Record<string, string> | undefined;
+  const temperature = readNumber(cloudflareEnv, 'LLM_TEMPERATURE', DEFAULT_OPENAI_TEMPERATURE, 0);
+  const coalesceMs = readNumber(cloudflareEnv, 'LLM_STREAM_COALESCE_MS', DEFAULT_COALESCE_MS, 0);
+  const factories = transports.map((transport) => ({
+    transport,
+    create: createWorkersAI(transport, { extraBody, coalesceMs }),
+  }));
+
+  const candidates: ModelCandidate[] = [];
+
+  /**
+   * Order: every transport of a model before the next model. The binding is
+   * first because it needs no secret; the REST API takes over when the binding
+   * is unavailable (local dev without `wrangler login`) or fails.
+   */
+  for (const spec of specs) {
+    for (const { transport, create } of factories) {
+      candidates.push({
+        provider: 'cloudflare',
+        transport: transport.kind,
+        modelId: spec.modelId,
+        model: create(spec.modelId),
+        maxTokens: spec.maxTokens ?? defaultMaxTokens,
+        headers,
+        temperature,
+      });
+    }
+  }
+
+  return dedupe(candidates);
+}
+
+/**
  * Builds the ordered list of models that Bolt will try for a request.
  *
- * `LLM_PROVIDER` selects `anthropic` or `openai` and is auto-detected when unset.
- * The OpenAI-compatible provider reads `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`,
- * `LLM_FALLBACK_MODELS`, `LLM_MAX_TOKENS`, `LLM_MAX_RETRIES`, `LLM_TEMPERATURE`,
- * `LLM_HEADERS` and `LLM_EXTRA_BODY` from `.env.local` or Cloudflare bindings.
- * See FREE-API-SETUP.md for ready to use examples with free providers.
+ * `LLM_PROVIDER` selects `cloudflare` (Workers AI), `openai` (any
+ * OpenAI-compatible endpoint) or `anthropic`, and is auto-detected when unset:
+ * an OpenAI-compatible endpoint wins when `LLM_BASE_URL`/`LLM_API_KEY` are set,
+ * then `ANTHROPIC_API_KEY`, then Workers AI when its binding or credentials
+ * exist. See CLOUDFLARE-DEPLOY.md and FREE-API-SETUP.md for ready to use setups.
  *
  * `ANTHROPIC_API_KEY` and the `OPENAI_*` aliases keep working, so the default
  * Bolt setup is unchanged when none of these variables are set.
@@ -201,20 +377,34 @@ export function getModelCandidates(cloudflareEnv: Env, primaryOverride?: string)
   const defaultMaxTokens = getMaxTokens(cloudflareEnv);
   const headers = readJsonObject(cloudflareEnv, 'LLM_HEADERS') as Record<string, string> | undefined;
 
-  const providerSetting = readEnv(cloudflareEnv, 'LLM_PROVIDER')?.toLowerCase();
+  const providerSetting = normalizeProvider(readEnv(cloudflareEnv, 'LLM_PROVIDER'));
   const anthropicKey = getAPIKey(cloudflareEnv);
   const openAIKey = readEnv(cloudflareEnv, 'LLM_API_KEY', 'OPENAI_API_KEY');
   const baseURL = readEnv(cloudflareEnv, 'LLM_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE');
+  const cloudflare = getCloudflareAIConfig(cloudflareEnv);
+  const cloudflareAvailable =
+    cloudflare.binding !== undefined || (cloudflare.accountId !== undefined && cloudflare.apiToken !== undefined);
 
-  const useOpenAI =
-    providerSetting === 'openai' ||
-    (providerSetting !== 'anthropic' && baseURL !== undefined) ||
-    (providerSetting !== 'anthropic' && openAIKey !== undefined && anthropicKey === undefined);
+  let provider: LLMProvider | undefined = providerSetting;
+
+  if (provider === undefined) {
+    if (baseURL !== undefined || (openAIKey !== undefined && anthropicKey === undefined)) {
+      provider = 'openai';
+    } else if (anthropicKey !== undefined) {
+      provider = 'anthropic';
+    } else if (cloudflareAvailable) {
+      provider = 'cloudflare';
+    }
+  }
 
   const primaryModel = primaryOverride ?? readEnv(cloudflareEnv, 'LLM_MODEL', 'OPENAI_MODEL');
   const fallbackModels = readEnv(cloudflareEnv, 'LLM_FALLBACK_MODELS');
 
-  if (useOpenAI) {
+  if (provider === 'cloudflare') {
+    return buildCloudflareCandidates(cloudflareEnv, cloudflare, primaryModel, fallbackModels, defaultMaxTokens);
+  }
+
+  if (provider === 'openai') {
     if (openAIKey === undefined && baseURL === undefined) {
       throw new Error(
         'Missing LLM_API_KEY (or OPENAI_API_KEY): set it in .env.local before using the OpenAI-compatible provider.',
@@ -236,31 +426,23 @@ export function getModelCandidates(cloudflareEnv: Env, primaryOverride?: string)
       fetch: withExtraBody(readJsonObject(cloudflareEnv, 'LLM_EXTRA_BODY')),
     });
 
-    const seen = new Set<string>();
-
-    return specs
-      .filter((spec) => {
-        if (seen.has(spec.modelId)) {
-          return false;
-        }
-
-        seen.add(spec.modelId);
-
-        return true;
-      })
-      .map((spec) => ({
+    return dedupe(
+      specs.map((spec) => ({
         provider: 'openai' as const,
         modelId: spec.modelId,
         model: openai(spec.modelId),
         maxTokens: spec.maxTokens ?? defaultMaxTokens,
         headers,
         temperature: readNumber(cloudflareEnv, 'LLM_TEMPERATURE', DEFAULT_OPENAI_TEMPERATURE, 0),
-      }));
+      })),
+    );
   }
 
   if (anthropicKey === undefined) {
     throw new Error(
-      'Missing ANTHROPIC_API_KEY: set it in .env.local, or configure an OpenAI-compatible endpoint with LLM_PROVIDER/LLM_BASE_URL/LLM_MODEL.',
+      provider === 'anthropic'
+        ? 'Missing ANTHROPIC_API_KEY: set it in .env.local, or configure another provider with LLM_PROVIDER.'
+        : 'No LLM provider configured. On Cloudflare the `[ai] binding = "AI"` from wrangler.toml (or CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN) enables Workers AI; alternatively set ANTHROPIC_API_KEY, or LLM_PROVIDER/LLM_BASE_URL/LLM_MODEL for an OpenAI-compatible endpoint.',
     );
   }
 
@@ -282,26 +464,16 @@ export function getModelCandidates(cloudflareEnv: Env, primaryOverride?: string)
     ...headers,
   };
 
-  const seen = new Set<string>();
-
-  return [...specs, ...parseModelSpecs(fallbackModels)]
-    .filter((spec) => {
-      if (seen.has(spec.modelId)) {
-        return false;
-      }
-
-      seen.add(spec.modelId);
-
-      return true;
-    })
-    .map((spec) => ({
+  return dedupe(
+    [...specs, ...parseModelSpecs(fallbackModels)].map((spec) => ({
       provider: 'anthropic' as const,
       modelId: spec.modelId,
       model: anthropic(spec.modelId),
       maxTokens: spec.maxTokens ?? defaultMaxTokens,
       headers: anthropicHeaders,
       temperature: readNumber(cloudflareEnv, 'LLM_TEMPERATURE', 0, 0),
-    }));
+    })),
+  );
 }
 
 /**

@@ -44,6 +44,7 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
       results.push({
         model: candidate.modelId,
         provider: candidate.provider,
+        transport: candidate.transport,
         ok: true,
         ms: Date.now() - started,
         reply: text.trim().slice(0, 80),
@@ -52,6 +53,7 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
       results.push({
         model: candidate.modelId,
         provider: candidate.provider,
+        transport: candidate.transport,
         ok: false,
         ms: Date.now() - started,
         error: describe(error),

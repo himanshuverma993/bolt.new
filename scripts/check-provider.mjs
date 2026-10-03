@@ -7,6 +7,10 @@
  * which ones answer. This is the fastest way to separate "wrong key or URL"
  * from "wrong model id" before starting the dev server.
  *
+ * Cloudflare Workers AI is checked through its OpenAI-compatible REST API
+ * (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`); the `AI` binding itself
+ * only exists inside Cloudflare, use `GET /api/llm-check` on a deployment for it.
+ *
  * Run it from the repo root, optionally with a timeout and a model limit.
  * The exit code is 1 when no model answers, 0 otherwise.
  */
@@ -15,6 +19,59 @@ import { resolve } from 'node:path';
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_PROMPT = 'Reply with the single word: pong';
+
+/* keep in sync with app/lib/.server/llm/model.ts and workers-ai.ts */
+const WORKERS_AI_DEFAULT_MODELS =
+  '@cf/google/gemma-4-26b-a4b-it,@cf/qwen/qwen2.5-coder-32b-instruct,@cf/meta/llama-4-scout-17b-16e-instruct';
+const WORKERS_AI_API_BASE = 'https://api.cloudflare.com/client/v4/accounts';
+const WORKERS_AI_GATEWAY_BASE = 'https://gateway.ai.cloudflare.com/v1';
+
+/**
+ * Resolves the endpoint to test: an explicit OpenAI-compatible endpoint, or
+ * the Workers AI REST API when Cloudflare credentials are configured.
+ */
+function resolveEndpoint(fileEnv) {
+  const provider = (pick(fileEnv, ['LLM_PROVIDER']) ?? '').toLowerCase();
+  const baseURL = pick(fileEnv, ['LLM_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE']);
+  const accountId = pick(fileEnv, ['CLOUDFLARE_ACCOUNT_ID', 'CF_ACCOUNT_ID']);
+  const apiToken = pick(fileEnv, ['CLOUDFLARE_API_TOKEN', 'CF_API_TOKEN']);
+  const wantsCloudflare = ['cloudflare', 'cloudflare-ai', 'workers-ai', 'workersai'].includes(provider);
+
+  if (wantsCloudflare || (baseURL === undefined && accountId !== undefined && apiToken !== undefined)) {
+    if (accountId === undefined || apiToken === undefined) {
+      return {
+        error:
+          'Workers AI selected, but CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN are missing in .env.local. ' +
+          'The AI binding cannot be used from this script; deploy and open GET /api/llm-check instead.',
+      };
+    }
+
+    const gatewayId = pick(fileEnv, ['CLOUDFLARE_AI_GATEWAY_ID']);
+    const override = pick(fileEnv, ['CLOUDFLARE_AI_BASE_URL']);
+    const cloudflareBase =
+      override ??
+      (gatewayId === undefined
+        ? `${WORKERS_AI_API_BASE}/${accountId}/ai/v1`
+        : `${WORKERS_AI_GATEWAY_BASE}/${accountId}/${gatewayId}/workers-ai/v1`);
+
+    return {
+      label: 'Cloudflare Workers AI (REST)',
+      baseURL: cloudflareBase,
+      apiKey: apiToken,
+      primary: pick(fileEnv, ['LLM_MODEL', 'OPENAI_MODEL']) ?? WORKERS_AI_DEFAULT_MODELS,
+      fallbacks:
+        pick(fileEnv, ['LLM_MODEL', 'OPENAI_MODEL']) === undefined ? undefined : pick(fileEnv, ['LLM_FALLBACK_MODELS']),
+    };
+  }
+
+  return {
+    label: 'OpenAI-compatible endpoint',
+    baseURL,
+    apiKey: pick(fileEnv, ['LLM_API_KEY', 'OPENAI_API_KEY']),
+    primary: pick(fileEnv, ['LLM_MODEL', 'OPENAI_MODEL']),
+    fallbacks: pick(fileEnv, ['LLM_FALLBACK_MODELS']),
+  };
+}
 
 function parseArgs(argv) {
   const options = { env: '.env.local', timeout: DEFAULT_TIMEOUT_MS, limit: Number.POSITIVE_INFINITY };
@@ -186,26 +243,30 @@ async function main() {
     return;
   }
 
-  const baseURL = pick(fileEnv, ['LLM_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE']);
-  const apiKey = pick(fileEnv, ['LLM_API_KEY', 'OPENAI_API_KEY']);
-  const primary = pick(fileEnv, ['LLM_MODEL', 'OPENAI_MODEL']);
+  const endpoint = resolveEndpoint(fileEnv);
+
+  if (endpoint.error !== undefined) {
+    console.error(`[check-llm] ${endpoint.error}`);
+    process.exitCode = 1;
+
+    return;
+  }
+
+  const { baseURL, apiKey, primary } = endpoint;
 
   if (baseURL === undefined || primary === undefined) {
     const provider = pick(fileEnv, ['LLM_PROVIDER']);
 
     console.log(
       provider === 'anthropic' || pick(fileEnv, ['ANTHROPIC_API_KEY']) === undefined
-        ? '[check-llm] no OpenAI-compatible endpoint configured (LLM_BASE_URL / LLM_MODEL missing).'
+        ? '[check-llm] nothing to test: configure Workers AI (CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN) or an OpenAI-compatible endpoint (LLM_BASE_URL + LLM_MODEL) in .env.local.'
         : '[check-llm] Anthropic is configured; run the app and use GET /api/llm-check for Anthropic diagnostics.',
     );
 
     return;
   }
 
-  const specs = [...parseModelSpecs(primary), ...parseModelSpecs(pick(fileEnv, ['LLM_FALLBACK_MODELS']))].slice(
-    0,
-    options.limit,
-  );
+  const specs = [...parseModelSpecs(primary), ...parseModelSpecs(endpoint.fallbacks)].slice(0, options.limit);
 
   let extraBody;
 
@@ -219,6 +280,7 @@ async function main() {
     }
   }
 
+  console.log(`[check-llm] provider: ${endpoint.label}`);
   console.log(`[check-llm] endpoint: ${baseURL}`);
   console.log(`[check-llm] models:   ${specs.map((spec) => spec.modelId).join(' -> ')}`);
   console.log('');
@@ -251,7 +313,11 @@ async function main() {
   if (anyOk) {
     console.log('[check-llm] at least one model answered, the chain is usable.');
   } else {
-    console.error('[check-llm] no model answered. Check the base URL, the key and the model ids.');
+    console.error(
+      endpoint.label.startsWith('Cloudflare')
+        ? '[check-llm] no model answered. Check the account id, the token permission (Workers AI > Read), the model ids and the daily neuron quota.'
+        : '[check-llm] no model answered. Check the base URL, the key and the model ids.',
+    );
     process.exitCode = 1;
   }
 }

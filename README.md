@@ -4,6 +4,14 @@
 
 Bolt.new is an AI-powered web development agent that allows you to prompt, run, edit, and deploy full-stack applications directly from your browser—no local setup required. If you're here to build your own AI-powered web dev agent using the Bolt open source codebase, [click here to get started!](./CONTRIBUTING.md)
 
+## Run it on Cloudflare with free Workers AI
+
+This fork deploys as a Cloudflare Pages app and uses **Cloudflare Workers AI** (free plan, no credit card, no third-party API key)
+as the model backend: connect the repo to Pages with build command `pnpm run build` and output directory `build/client` — the
+`AI` binding and the model chain are already configured in `wrangler.toml`. Step-by-step guide, model options, free-plan limits
+and local development: **[CLOUDFLARE-DEPLOY.md](./CLOUDFLARE-DEPLOY.md)**. Other free OpenAI-compatible providers:
+[FREE-API-SETUP.md](./FREE-API-SETUP.md).
+
 ## What Makes Bolt.new Different
 
 Claude, v0, etc are incredible- but you can't install packages, run backends or edit code. That’s where Bolt.new stands out:

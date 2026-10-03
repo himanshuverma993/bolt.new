@@ -42,6 +42,7 @@ async function enhancerAction({ context, request }: ActionFunctionArgs) {
           .split('\n')
           .filter((line) => line !== '')
           .map(parseStreamPart)
+          .filter((part) => part.type === 'text')
           .map((part) => part.value)
           .join('');
 

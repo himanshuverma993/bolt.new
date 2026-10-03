@@ -1,6 +1,7 @@
 import { streamText as _streamText, convertToCoreMessages } from 'ai';
 import { createScopedLogger } from '~/utils/logger';
 import {
+  candidateLabel,
   getMaxRetries,
   getModelCandidates,
   getStreamTimeouts,
@@ -137,7 +138,7 @@ async function openWithFallback(
 
   for (const [index, candidate] of candidates.entries()) {
     const isLast = index === candidates.length - 1;
-    const label = `${candidate.provider}/${candidate.modelId}`;
+    const label = candidateLabel(candidate);
     const abort = new AbortController();
     const deadline = Date.now() + timeouts.firstTokenMs;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -250,7 +251,7 @@ function pumpRemainingChunks(attempt: OpenAttempt, timeouts: StreamTimeouts): Re
               attempt.reader.read(),
               timeouts.idleMs,
               attempt.abort,
-              `${attempt.candidate.provider}/${attempt.candidate.modelId} stream`,
+              `${candidateLabel(attempt.candidate)} stream`,
             );
 
             if (cancelled) {
@@ -267,7 +268,7 @@ function pumpRemainingChunks(attempt: OpenAttempt, timeouts: StreamTimeouts): Re
           safeClose();
         } catch (error) {
           logger.error(
-            `${attempt.candidate.provider}/${attempt.candidate.modelId} failed mid-stream, cannot fail over:`,
+            `${candidateLabel(attempt.candidate)} failed mid-stream, cannot fail over:`,
             describeError(error),
           );
 
